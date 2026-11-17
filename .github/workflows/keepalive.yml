@@ -37,7 +37,39 @@ jobs:
               | jq -r '.state // "unknown"' 2>/dev/null || echo unknown
           }
 
-          # 1) renew the lease: blocks the 30-min idle pause; also wakes a paused box
+          # 1) make sure the box is running. A failed reset can leave it
+          #    suspended; while it sits there every lease PUT answers 409 and
+          #    the old code exited "successfully" without ever recovering it.
+          st=$(get_state)
+          echo "state=$st"
+          if [ "$st" = "suspended" ] || [ "$st" = "stopped" ]; then
+            curl -sS --max-time 20 -H "$AUTH" "$API" -o /tmp/m0.json
+            cd_until=$(jq -r '.cooldownUntil // empty' /tmp/m0.json)
+            cd_ts=$(date -u -d "$cd_until" +%s 2>/dev/null || echo 0)
+            if [ -n "$cd_until" ] && [ "$cd_ts" -gt "$(date -u +%s)" ]; then
+              echo "max-run cooldown until $cd_until - waiting, next tick retries"
+              exit 0
+            fi
+            ep=resume
+            [ "$st" = "stopped" ] && ep=start
+            echo "box is $st without an active cooldown -> $ep"
+            rcode=$(curl -sS --max-time 30 -o /tmp/op.out -w '%{http_code}' \
+              -X POST -H "$AUTH" -H "$CT" -H "$IK" -d '{}' "$API/$ep" || echo 000)
+            echo "$ep -> HTTP $rcode $(head -c 200 /tmp/op.out 2>/dev/null)"
+            for i in $(seq 1 24); do
+              sleep 5
+              st=$(get_state)
+              [ "$st" = "running" ] && break
+            done
+            echo "after $ep -> $st"
+            if [ "$st" != "running" ]; then
+              echo "::error::recovery failed (state=$st)"
+              exit 1
+            fi
+          fi
+
+          # 2) renew the lease: blocks the 30-min idle pause; a lease PUT also
+          #    wakes an auto-paused box (step 1 already handled any pause)
           code=$(curl -sS -o /tmp/lease.out -w '%{http_code}' --max-time 30 \
             -X PUT -H "$AUTH" -H "$CT" \
             -d '{"ttlSeconds":3600}' \
@@ -47,35 +79,13 @@ jobs:
             200|201)
               ok=1 ;;
             409)
-              echo "max-run cooldown in progress; next tick's lease will wake the box"
-              exit 0 ;;
+              echo "::warning::lease conflict while running: $(head -c 200 /tmp/lease.out 2>/dev/null)" ;;
             401|403)
               echo "::error::API key invalid or missing machines:write scope"
               exit 1 ;;
             *)
               echo "::warning::lease returned $code: $(head -c 300 /tmp/lease.out 2>/dev/null)" ;;
           esac
-
-          # 2) wait until running， (the lease may be waking it; recover stopped/suspended)
-          st=unknown
-          for i in $(seq 1 18); do
-            st=$(get_state)
-            case "$st" in
-              running) break ;;
-              stopped)
-                echo "state=stopped -> start"
-                curl -sS --max-time 30 -X POST -H "$AUTH" -H "$CT" -H "$IK" -d '{}' "$API/start" -o /dev/null ;;
-              suspended)
-                echo "state=suspended -> resume"
-                curl -sS --max-time 30 -X POST -H "$AUTH" -H "$CT" -H "$IK" -d '{}' "$API/resume" -o /dev/null ;;
-            esac
-            sleep 5
-          done
-          echo "state=$st"
-          if [ "$st" != "running" ]; then
-            echo "::error::machine not running (state=$st)"
-            exit 1
-          fi
 
           # 3) less than 15 min left in the run window -> suspend+resume to reset it
           #    (avoids the forced pause and the escalating cooldowns)
@@ -96,15 +106,25 @@ jobs:
                 [ "$st" = "suspended" ] && break
               done
               echo "suspended -> $st"
-              curl -sS --max-time 30 -X POST -H "$AUTH" -H "$CT" -H "$IK" -d '{}' "$API/resume" -o /dev/null
-              for i in $(seq 1 18); do
-                sleep 5
-                st=$(get_state)
+              # let the suspend operation settle: a resume issued too early is
+              # rejected, which left the box frozen until a later tick recovered it
+              sleep 15
+              st=unknown
+              for attempt in 1 2 3; do
+                rcode=$(curl -sS --max-time 30 -o /tmp/resume.out -w '%{http_code}' \
+                  -X POST -H "$AUTH" -H "$CT" -H "$IK" -d '{}' "$API/resume" || echo 000)
+                echo "resume attempt $attempt -> HTTP $rcode $(head -c 200 /tmp/resume.out 2>/dev/null)"
+                for i in $(seq 1 6); do
+                  sleep 5
+                  st=$(get_state)
+                  [ "$st" = "running" ] && break
+                done
                 [ "$st" = "running" ] && break
+                sleep 10
               done
-              echo "resumed -> $st"
+              echo "after resume retries -> $st"
               if [ "$st" != "running" ]; then
-                echo "::error::not running after reset (state=$st)"
+                echo "::error::not running after reset (state=$st); a later tick recovers it"
                 exit 1
               fi
               # lifecycle ops invalidate leases: rebuild immediately

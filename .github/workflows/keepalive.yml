@@ -56,7 +56,7 @@ jobs:
               echo "::warning::lease returned $code: $(head -c 300 /tmp/lease.out 2>/dev/null)" ;;
           esac
 
-          # 2) wait until running (the lease may be waking it; recover stopped/suspended)
+          # 2) wait until running， (the lease may be waking it; recover stopped/suspended)
           st=unknown
           for i in $(seq 1 18); do
             st=$(get_state)

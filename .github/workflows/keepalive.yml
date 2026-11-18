@@ -4,7 +4,7 @@ on:
 permissions: {}
 env:
   MACHINE_ID: ${{ vars.INSTABOX_MACHINE_ID }}
-  LEASE_KEY: *** INSTABOX_API_KEY }}
+  LEASE_KEY: ${{ secrets.INSTABOX_API_KEY }}
   HOST: api.instabox.sh
 jobs:
   keepalive:
@@ -20,12 +20,12 @@ jobs:
           # NO suspend/reset here: resume right after our own suspend is
           # rejected by the platform cooldown (0/6, froze the box ~10 min
           # each time); resume-of-an-already-suspended box is 6/6.
-          S=$(curl -sS --max-time 20 -H "X-API-Key: ***"$B/state" || echo '{}')
+          S=$(curl -sS --max-time 20 -H "X-API-Key: $K" "$B/state" || echo '{}')
           echo "state: $S"
           if echo "$S" | grep -q '"suspended"'; then
             for i in 1 2 3; do
               code=$(curl -sS -o /tmp/resume.json -w '%{http_code}' --max-time 25 \
-                -X POST -H "X-API-Key: ***"$B/resume" || echo 000)
+                -X POST -H "X-API-Key: $K" "$B/resume" || echo 000)
               echo "resume attempt $i -> $code"
               [ -f /tmp/resume.json ] && head -c 200 /tmp/resume.json && echo
               if [ "$code" = "200" ] || [ "$code" = "201" ]; then break; fi
@@ -34,7 +34,7 @@ jobs:
           fi
           # step 2: renew activity lease (idle protection)
           code=$(curl -sS -o /tmp/lease.json -w '%{http_code}' --max-time 20 \
-            -X PUT -H "X-API-Key: ***"activity":"external_renewal","ttl":3600}' "$B/activity" || echo 000)
+            -X PUT -H "X-API-Key: $K" -H 'Content-Type: application/json' -d '{"activity":"external_renewal","ttl":3600}' "$B/activity" || echo 000)
           echo "lease -> $code"
           head -c 200 /tmp/lease.json; echo
           [ "$code" = "200" ] || [ "$code" = "201" ]

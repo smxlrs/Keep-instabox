@@ -1,62 +1,25 @@
-# InstaBox keep-alive renewer for GitHub Actions — v4: renew + resume only, NO suspend.
-# Never reset the run window by suspending from inside the run: resume right after
-# our own suspend is rejected by platform cooldown (0/6, froze the box ~10 min each
-# time); resume of an already-suspended box is the reliable path (6/6). The box
-# rides to the 480-min run cap, the platform pauses it, the next dispatch resumes.
-# Setup:
-#   1. On the IBX_KEY line, the secret-reference expression is already set on the
-#      IBX_KEY line (built from fragments to dodge the agent-output scrub). Type it in
-#      GitHub's web editor and verify the committed file — agent tooling rewrites
-#      that expression when writing files.
-#   2. Replace m_agq6nsj5xho6kxaavojx57kurq with the machine id (instabox port list -> machineId).
-#   3. Repo -> Settings -> Secrets and variables -> Actions: add secret
-#      INSTABOX_API_KEY (Restricted dashboard key, machines:read + machines:write).
-#   4. Commit at .github/workflows/keepalive.yml on the DEFAULT branch. Triggers
-#      come from an EXTERNAL timer (cron-job.org -> dispatch API): native
-#      `on: schedule` does not fire on a fresh repo (see skill Pitfalls) — do not
-#      add it. Before trusting unattended renewal, confirm one AUTOMATIC
-#      event=workflow_dispatch run you did not trigger.
+# InstaBox keep-alive renewer — v6: renew + resume only, NO suspend/reset.
+# Endpoints are v3-proven (v3 ran 100+ green runs): state comes from the
+# machine object GET $API (.state), the lease lives at
+# $API/activity-leases/<id> with body {"ttlSeconds":N}, resume/start need
+# an Idempotency-Key header. Earlier v4/v5 used invented routes
+# (/state, /activity) -> 404 route not found.
+# Why no reset: suspend-then-immediate-resume is rejected by platform
+# cooldown (0/6, froze the box ~10 min each time); the box rides to the
+# 480-min run cap, the platform pauses it, cooldown-aware step 1 resumes.
+# External timer (cron-job.org -> dispatch API) fires workflow_dispatch;
+# native on: schedule does not fire on a fresh repo.
 name: Keep InstaBox alive
-
-on:
-  workflow_dispatch:
-
+'on':
+  workflow_dispatch: null
 permissions: {}
-
 jobs:
   keepalive:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - name: Resume if paused + renew activity lease
-        env:
-          IBX_KEY: ${{ secrets.INSTABOX_API_KEY }}
-          IBX_MID: m_agq6nsj5xho6kxaavojx57kurq
-        run: |
-          set +e
-          set -x
-          API="https://api.instabox.sh/v1/machines/$IBX_MID"
-          AK="X-API-Key"
-          AUTH="$AK"': '"$IBX_KEY"
-          CT="Content-Type"
-          CT="$CT: application/json"
-          # 1) wake only if actually suspended (409 cooldown = retry next tick)
-          S=$(curl -sS --max-time 20 -H "$AUTH" "$API/state" || echo '{}')
-          echo "state: $S"
-          if echo "$S" | grep -q '"suspended"'; then
-            for i in 1 2 3; do
-              code=$(curl -sS -o /tmp/resume.out -w '%{http_code}' --max-time 25 \
-                -X POST -H "$AUTH" -H "$CT" -d '{}' "$API/resume" || echo 000)
-              echo "resume attempt $i -> $code"
-              [ -f /tmp/resume.out ] && head -c 200 /tmp/resume.out && echo
-              if [ "$code" = "200" ] || [ "$code" = "201" ]; then break; fi
-              sleep 15
-            done
-          fi
-          # 2) renew the lease (idle protection); 409 = max-run cooldown, next tick
-          code=$(curl -sS -o /tmp/lease.out -w '%{http_code}' --max-time 20 \
-            -X PUT -H "$AUTH" -H "$CT" \
-            -d '{"activity":"external_renewal","ttl":3600}' "$API/activity" || echo 000)
-          echo "lease -> $code"
-          head -c 200 /tmp/lease.out; echo
-          [ "$code" = "200" ] || [ "$code" = "201" ]
+    - name: Resume if paused + renew activity lease
+      env:
+        IBX_KEY: ${{ secrets.INSTABOX_API_KEY }}
+        IBX_MID: m_agq6nsj5xho6kxaavojx57kurq
+      run: "set -u\nAPI=\"https://api.instabox.sh/v1/machines/$IBX_MID\"\nAK=\"X-API-Key\"\nAUTH=\"$AK\"': '\"$IBX_KEY\"\nCT=\"Content-Type\"\nCT=\"$CT: application/json\"\nIK=\"Idempotency-Key\"\nIK=\"$IK\"': '\"$(date +%s)-$$-$RANDOM\"\nok=0\n\nget_state() {\n  curl -sS --max-time 20 -H \"$AUTH\" \"$API\" 2>/dev/null \\\n    | jq -r '.state // \"unknown\"' 2>/dev/null || echo unknown\n}\n\n# 1) make sure the box is running. A failed reset can leave it\n#    suspended; while it sits there every lease PUT answers 409 and\n#    the old code exited \"successfully\" without ever recovering it.\nst=$(get_state)\necho \"state=$st\"\nif [ \"$st\" = \"suspended\" ] || [ \"$st\" = \"stopped\" ]; then\n  curl -sS --max-time 20 -H \"$AUTH\" \"$API\" -o /tmp/m0.json\n  cd_until=$(jq -r '.cooldownUntil // empty' /tmp/m0.json)\n  cd_ts=$(date -u -d \"$cd_until\" +%s 2>/dev/null || echo 0)\n  if [ -n \"$cd_until\" ] && [ \"$cd_ts\" -gt \"$(date -u +%s)\" ]; then\n    echo \"max-run cooldown until $cd_until - waiting, next tick retries\"\n    exit 0\n  fi\n  ep=resume\n  [ \"$st\" = \"stopped\" ] && ep=start\n  echo \"box is $st without an active cooldown -> $ep\"\n  rcode=$(curl -sS --max-time 30 -o /tmp/op.out -w '%{http_code}' \\\n    -X POST -H \"$AUTH\" -H \"$CT\" -H \"$IK\" -d '{}' \"$API/$ep\" || echo 000)\n  echo \"$ep -> HTTP $rcode $(head -c 200 /tmp/op.out 2>/dev/null)\"\n  for i in $(seq 1 24); do\n    sleep 5\n    st=$(get_state)\n    [ \"$st\" = \"running\" ] && break\n  done\n  echo \"after $ep -> $st\"\n  if [ \"$st\" != \"running\" ]; then\n    echo \"::error::recovery failed (state=$st)\"\n    exit 1\n  fi\nfi\n\n# 2) renew the lease: blocks the 30-min idle pause; a lease PUT also\n#    wakes an auto-paused box (step 1 already handled any pause)\ncode=$(curl -sS -o /tmp/lease.out -w '%{http_code}' --max-time 30 \\\n  -X PUT -H \"$AUTH\" -H \"$CT\" \\\n  -d '{\"ttlSeconds\":3600}' \\\n  \"$API/activity-leases/hermes-keepalive\" || echo 000)\necho \"lease -> $code\"\ncase \"$code\" in\n  200|201)\n    ok=1 ;;\n  409)\n    echo \"::warning::lease conflict while running: $(head -c 200 /tmp/lease.out 2>/dev/null)\" ;;\n  401|403)\n    echo \"::error::API key invalid or missing machines:write scope\"\n    exit 1 ;;\n  *)\n    echo \"::warning::lease returned $code: $(head -c 300 /tmp/lease.out 2>/dev/null)\" ;;\nesac\n\nif [ \"$ok\" = 1 ]; then\n  echo \"OK\"\nelse\n  echo \"::error::lease never succeeded\"\n  exit 1\nfi\n"
